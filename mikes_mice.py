@@ -4,6 +4,8 @@ from sklearn.preprocessing import Imputer, OneHotEncoder
 from sklearn.linear_model import LinearRegression, LogisticRegression
 from sklearn.model_selection import train_test_split
 from sklearn.base import clone
+from sklearn.exceptions import DataConversionWarning
+import warnings
 import numpy as np
 import pandas as pd
 import time
@@ -86,7 +88,7 @@ class ChainedImputer():
                          axis=1,
                          ignore_index=False)
 
-    def _fill_col(self, train_df, estimator, col_for_prediction, mask_indices):
+    def _fill_col(self, train_df, estimator, col_for_prediction, mask_indices,):
         """Takes one_hot_encoded df as input, fits model on all rows, predicts target col on rows with
         missing values, and returns the column with new predicted values"""
         
@@ -96,7 +98,7 @@ class ChainedImputer():
         predictions = estimator.predict(train_df.iloc[mask_indices])
         # Return column with predictions
         predicted_col = col_for_prediction.copy()
-        predicted_col.iloc[mask_indices] = predictions
+        predicted_col.iloc[mask_indices] = predictions.reshape(-1,1)
         return predicted_col
 
     @staticmethod
@@ -195,7 +197,8 @@ class ChainedImputer():
         on the percentage change in imputed variables at the end of each iteration.
 
         refit_after_transform : bool, default True
-        If True, will refit estimators on final imputed DataFrame after imputation is complete.
+        If True, will refit all estimators on final imputed DataFrame after imputation is complete. Recommended if
+        imputer will be reused on test data.
 
         Returns
         -------
@@ -244,7 +247,8 @@ class ChainedImputer():
                 # Record time of iteration start
                 iter_start_time = time.time()
                 # Complete one round of imputation using fill_col()
-                for col in cols_for_impute:
+                for i, col in enumerate(cols_for_impute):
+                    if verbose > 2: print(f'Imputing {col} ({i+1}/{len(cols_for_impute)})...')
                     # Set correct model
                     estimator = self.estimators_[col]
                     # Get list of columns to drop from prediction df and if categorical, create column in its original state
@@ -268,13 +272,16 @@ class ChainedImputer():
                         # Update df with new values
                         one_hot_seeded[self.one_hot_dict[col]] = pd.get_dummies(filled_col, prefix_sep='__sep__', columns=self.one_hot_dict[col])
                     if col in self.cont_cols_for_impute:
-                        filled_col = self._fill_col(one_hot_seeded.drop(columns=cols_of_interest, axis=1), estimator, col_for_prediction, mask_indices)
-                        # Find percentage of values changes
-                        cont_change = 100 * (abs(filled_col.iloc[mask_indices] - one_hot_seeded[cols_of_interest].iloc[mask_indices])).sum() / one_hot_seeded[cols_of_interest].iloc[mask_indices].sum()
-                        # Save percentage change to list              
-                        iteration_cont_change.append(cont_change)
-                        # Update df with new values
-                        one_hot_seeded[col] = filled_col
+                        # Ignore DataConversionWarnings since sklearn is returning unfixable warnings
+                        with warnings.catch_warnings():
+                            warnings.filterwarnings(action='ignore', category=DataConversionWarning)
+                            filled_col = self._fill_col(one_hot_seeded.drop(columns=cols_of_interest, axis=1), estimator, col_for_prediction, mask_indices)
+                            # Find percentage of values changes
+                            cont_change = 100 * (abs(filled_col.iloc[mask_indices] - one_hot_seeded[cols_of_interest].iloc[mask_indices])).sum() / one_hot_seeded[cols_of_interest].iloc[mask_indices].sum()
+                            # Save percentage change to list              
+                            iteration_cont_change.append(cont_change)
+                            # Update df with new values
+                            one_hot_seeded[col] = filled_col
                 if verbose > 1:
                     print(f'--> Mean percentage change in imputed continuous values: %.2f%%.\n--> Mean percentage change in imputed categorical values: %.2f%%\nIteration %d completed in %.2f seconds.\n' % 
                         (np.mean(iteration_cont_change), np.mean(iteration_cat_change), 
@@ -296,7 +303,7 @@ class ChainedImputer():
                 # Train model
                 estimator.fit(one_hot_seeded.drop(cols_of_interest, axis=1), col_for_prediction)
                 if verbose > 1: print(f'Estimator fit for {col} ({n+1}/{len(self.cat_cols_for_impute+self.cont_cols_for_impute)})')
-            self.completed_fit = True
+            self.fit_completed = True
             if verbose > 0: print('Refitting complete')
 
         # Reverse one-hot encoding and return processed df
@@ -310,46 +317,49 @@ class ChainedImputer():
         # Return df with columns ordered as original
         if inplace:
             df[self.cat_cols_for_impute+self.cont_cols_for_impute] = one_hot_seeded[self.cat_cols_for_impute+self.cont_cols_for_impute]
-            return None
+            # print(df.isna().sum())
+            return df
         else:
-            one_hot_seeded = one_hot_seeded[ordered_final_cols]
+            # one_hot_seeded = one_hot_seeded[ordered_final_cols]
+            # print(one_hot_seeded.isna().sum())
             return one_hot_seeded
 
 class MICEImputer(ChainedImputer):
-        """
-        Encode categorical and continuous variables using Multiple Imputation Chained Equations (MICE) method.
-        Supports pandas DataFrames with familiar fit/fit_transform/transform methods.
+    """
+    Encode categorical and continuous variables using Multiple Imputation Chained Equations (MICE) method.
+    Supports pandas DataFrames with familiar fit/fit_transform/transform methods.
 
-        Parameters
-        ----------
-        cat_cols_for_impute : list of string objects
-            List of categorical column names to be used as predictors in imputation process and to be imputed
-            (if missing values are present). Columns must be of number datatypes (no support yet for strings).
-            Columns defined must also be present in 
+    Parameters
+    ----------
+    cat_cols_for_impute : list of string objects
+        List of categorical column names to be used as predictors in imputation process and to be imputed
+        (if missing values are present). Columns must be of number datatypes (no support yet for strings).
+        Columns defined must also be present in 
 
-        cont_cols_for_impute : list of strong objects
-            List of continuous column names to be used as predictors in imputation process and to be imputed
-            (if missing values are present). Columns must be of number datatypes.
+    cont_cols_for_impute : list of strong objects
+        List of continuous column names to be used as predictors in imputation process and to be imputed
+        (if missing values are present). Columns must be of number datatypes.
 
-        cat_model : Estimator object
-        The model to be used for prediction of categorical variables.  By default, vanilla Logistic Regression models
-        will be used for each categorical variable.
+    cat_model : Estimator object
+    The model to be used for prediction of categorical variables.  By default, vanilla Logistic Regression models
+    will be used for each categorical variable.
 
-        cont_model : Estimator object
-        The model to use as predictors of continuous variables.  By default, vanilla Linear Regression models
-        will be used for each continuous variable.
+    cont_model : Estimator object
+    The model to use as predictors of continuous variables.  By default, vanilla Linear Regression models
+    will be used for each continuous variable.
 
-        Returns
-        -------
-        self
-        """
+    Returns
+    -------
+    self
+    """
     def __init__(self, cat_cols_for_impute, cont_cols_for_impute, cat_model='log reg', cont_model='lin reg'):
         super().__init__(cat_cols_for_impute, cont_cols_for_impute, cat_model=cat_model, cont_model=cont_model)
 
     def fit_transform(self, df, n_iter=10, n_datasets=3, inplace=True, verbose=1, refit_after_transform=True):
         """
         Performs n_iter iterations of Chained Equation imputation on dataframe, and then refits estimators on the
-        imputed dataframe. If DataFrame has no missing data, estimators are fit on the entire dataset.
+        imputed dataframe. Memory usage is the same for all n_datasets <= 2. If DataFrame has no missing data, 
+        estimators are fit on the entire dataset.
 
         Parameters
         ----------
@@ -369,7 +379,8 @@ class MICEImputer(ChainedImputer):
         on the percentage change in imputed variables at the end of each iteration.
 
         refit_after_transform : bool, default True
-        If True, will refit estimators on final imputed DataFrame after imputation is complete.
+        If True, will refit all estimators on final imputed DataFrame after imputation is complete. Recommended if
+        imputer will be reused on test data.
 
         Returns
         -------
@@ -381,7 +392,7 @@ class MICEImputer(ChainedImputer):
         if verbose > 0: print('Imputing dataset 1:')
         datasets_start_time = time.time()
         datasets = []
-        # Skip imputation if no missing values
+        # Only run imputation if no missing values
         if df.isna().sum().sum() > 0:
             # fit_transform once, get back new imputed df
             imputed_df = super().fit_transform(df, n_iter=n_iter, verbose=verbose, inplace=False, refit_after_transform=False)
@@ -390,8 +401,13 @@ class MICEImputer(ChainedImputer):
             # Create n-1 imputed datasets, updating imputed df with new values
             for n in range(n_datasets - 1):
                 print(f'Imputing dataset {n+2}:')
+                n_dataset_start_time = time.time()
                 extra_imputed_df = super().fit_transform(df, n_iter=n_iter, verbose=verbose, inplace=False, refit_after_transform=False)
                 imputed_df = imputed_df * ((n+1)/(n+2)) + extra_imputed_df / (n+2)
+                time_to_complete = time.time() - n_dataset_start_time
+                if verbose > 0: print('Dataset %i imputed in %2.f %s.\n' % (n+2, (time_to_complete if time_to_complete < 100 else time_to_complete/60), ('seconds' if time_to_complete < 100 else 'minutes')))
+        if verbose > 0: print("MICE imputation completed in %1.f minutes\n" % ((time.time() - datasets_start_time) / 60))
+        
         if refit_after_transform:
             # Refit the estimators on the MICE imputed dataset
             if verbose > 0: print('Refitting estimators on final MICE-imputed dataset...')
@@ -416,18 +432,18 @@ class MICEImputer(ChainedImputer):
                 # Train model
                 estimator.fit(one_hot_seeded.drop(cols_of_interest, axis=1), col_for_prediction)
                 if verbose > 2: print(f'Estimator fit for {col} ({n+1}/{len(self.cat_cols_for_impute+self.cont_cols_for_impute)})')
-            self.completed_fit = True
+            self.fit_completed = True
             if verbose > 0: print('Refitting complete')
-            self.fit_completed
         if inplace:
-            df = imputed_df
+            df[self.cat_cols_for_impute+self.cont_cols_for_impute] = imputed_df[self.cat_cols_for_impute+self.cont_cols_for_impute]
             return None
         return imputed_df
 
     def transform(self, df, n_iter=10, n_datasets=3, inplace=True, verbose=1):
         """
         Imputer missing values in DataFrame by Performing MICE across n_datasets datasets for n_iter 
-        iterations each. If DataFrame has no missing data, original data is returned.
+        iterations each. Memory usage is the same for all n_datasets <= 2. If DataFrame has no missing 
+        data, original data is returned.
 
         Parameters
         ----------
@@ -453,12 +469,12 @@ class MICEImputer(ChainedImputer):
         """
         if not self.fit_completed:
             print("Error: Imputer has not yet been fit. Use ``fit`` or ``fit_transform`` first.")
-            return None
+            return df
         self.transform_mode = True
         if inplace:
             self.fit_transform(df, n_iter=n_iter, n_datasets = n_datasets, inplace=True, verbose=verbose, refit_after_transform=False)
             self.transform_mode = False
-            return None
+            return df
         else:
             transformed_df = self.fit_transform(df, n_iter=n_iter, n_datasets = n_datasets, inplace=False, verbose=verbose, refit_after_transform=False)
             self.transform_mode = False
@@ -467,9 +483,9 @@ class MICEImputer(ChainedImputer):
     def fit(self, df, n_iter=10, n_datasets=3, verbose=1):
         """
         Fits Imputer on DataFrame by Performing MICE across n_datasets datasets for n_iter iterations each.
-        ``cat_cols_for_impute``  and ``cont_cols_for_impute`` are lists of categorical and continuous columns
-        to use as predictor & imputation targets. If DataFrame has no missing data, estimators are fit on
-         the entire dataset.
+        Memory usage is the same for all n_datasets <= 2. ``cat_cols_for_impute``  and ``cont_cols_for_impute`` 
+        are lists of categorical and continuous columns to use as predictor & imputation targets. If DataFrame 
+        has no missing data, estimators are fit on the entire dataset.
 
         Parameters
         ----------
